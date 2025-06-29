@@ -1,0 +1,1 @@
+python3 preprocessing.py --window_size=64 --strided=32 --indir ./data/set_04/test_03_known_vehicle_unknown_attack/merged --outdir ./data/set_04/test_03_known_vehicle_unknown_attack/preprocessed/one_type/triple/TFRecord
