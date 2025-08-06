@@ -111,3 +111,7 @@ python3 train_test_split_all.py
 
 ## Reference
 
+**(2) AE**
+```
+python train_shrinkage_ae_generate_ood.py --data_folder ./data/set_04/train_01/preprocessed/six_features/TFRecord_w64_s32/2 --ood_save_path ./data/set_04/test_03_known_vehicle_unknown_attack/preprocessed/ood/generated_ood.tfrecord
+```

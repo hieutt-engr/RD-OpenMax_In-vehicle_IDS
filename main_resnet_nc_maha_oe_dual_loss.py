@@ -15,18 +15,17 @@ import torch
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.nn import TripletMarginLoss
 import pickle
-from open_gan import Generator, Discriminator, loss_discriminator_wgan_gp, loss_generator_wgan_gp, gradient_penalty
 
 import pprint
 from torchvision import transforms
-from dataset import CANDatasetEnet as CANDataset
-from losses import SupConLoss, pairwise_loss_v2
-from util import AverageMeter, AddGaussianNoise
-from rd_openmax import fit_weibull_rd, openmax_predict_rd, extract_class_stats 
+from dataset import CANDatasetEnet as CANDataset, OEOfflineDataset
+from losses import SupConLoss, cdef_loss, fdef_loss, opsupcon_loss
+from util import AverageMeter, AddGaussianNoise, PrototypeTracker, RandomPatchShuffle, TwoCropTransform, get_next_oe_batch
+from rd_openmax_maha import openmax_predict_mahalanobis, extract_class_stats_mahalanobis, fit_weibull_mahalanobis
 from util import warmup_learning_rate
-from util import save_model , accuracy
+from util import save_model, accuracy
+from torch.utils.data import DataLoader
 from networks.con_mpncovresnet import ConTinyMPNCOVResNet , LinearClassifier
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, accuracy_score
 from torch.utils.tensorboard import SummaryWriter
@@ -47,6 +46,17 @@ def parse_option():
                         help='number of training epochs')
     parser.add_argument('--resume', type=str, default=None, 
                         help='path to the checkpoint to resume from')
+    # OE setting
+    parser.add_argument('--warmup_epoch', type=int, default=60,
+                        help='number of warmup epochs for close-set training')
+    parser.add_argument('--lambda_pe', type=float, default=0.1,
+                        help='weight for tightness loss')
+    parser.add_argument('--lambda_oh', type=float, default=0.2,
+                        help='weight for pushOE loss (after warmup)')
+    parser.add_argument('--proto_shift_thresh', type=float, default=0.05,
+                        help='prototype shift threshold')
+    parser.add_argument('--margin', type=float, default=0.4,
+                        help='margin for contrastive loss')
     
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.03,
@@ -59,6 +69,7 @@ def parse_option():
                         help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum')
+    
     # optimization classifier
     parser.add_argument('--epoch_start_classifier', type=int, default=90)
     parser.add_argument('--learning_rate_classifier', type=float, default=0.01,
@@ -88,6 +99,8 @@ def parse_option():
                         help='path to custom dataset')
     parser.add_argument('--open_set_test_data', type=str, default=None,
                     help='Path to additional test data (for RD-OpenMax)')
+    parser.add_argument('--oe_data_root', type=str, default=None,
+                    help='Path to the root directory of the OE dataset')
     parser.add_argument('--n_classes', type=int, default=6, 
                         help='number of class')
 
@@ -116,6 +129,7 @@ def parse_option():
     opt = parser.parse_args()
 
     opt.device = torch.device('cuda:0')
+
 
     opt.model_path = './save/{}_models/{}'.format(opt.dataset, opt.method)
     iterations = opt.lr_decay_epochs.split(',')
@@ -164,26 +178,60 @@ def set_loader(opt):
     train_transform = transforms.Compose([
         transforms.RandomApply([AddGaussianNoise(0., 0.05)], p=0.5),
         transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
-        transforms.Normalize(mean=mean, std=std)
+        normalize
     ])
-    # Khởi tạo dataset
-    train_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=True, transform=train_transform)
-    close_set_test_dataset = CANDataset(root_dir=opt.close_set_test_data, window_size=32, is_train=False, transform=transform)
+
+    # Dataset
+    train_dataset = CANDataset(
+        root_dir=opt.data_folder, window_size=32, is_train=True,
+        transform=TwoCropTransform(train_transform)
+    )
+    close_set_test_dataset = CANDataset(
+        root_dir=opt.close_set_test_data, window_size=32,
+        is_train=False, transform=transform
+    )
+
+    transform_oe = transforms.Compose([
+        transforms.RandomApply([RandomPatchShuffle(num_patches=4)], p=0.7),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.3, 1.5))], p=0.5),
+        transforms.RandomApply([transforms.RandomErasing(scale=(0.02, 0.2))], p=0.3),
+        transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
+    ])
+
+    support_oe_dataset = OEOfflineDataset(
+        tfrecord_path=opt.oe_data_root,
+        target_size=64,
+        transform=transform_oe
+    )
+
+    support_oe_loader = torch.utils.data.DataLoader(
+        support_oe_dataset, batch_size=128, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True
+    )
 
     open_set_test_loader = None
     if opt.open_set_test_data:
-        open_set_test_dataset = CANDataset(root_dir=opt.open_set_test_data, window_size=32, is_train=False, transform=transform)
-        open_set_test_loader = torch.utils.data.DataLoader(open_set_test_dataset, batch_size=opt.batch_size, shuffle=False,  pin_memory=True)
+        open_set_test_dataset = CANDataset(
+            root_dir=opt.open_set_test_data, window_size=32,
+            is_train=False, transform=transform
+        )
+        open_set_test_loader = torch.utils.data.DataLoader(
+            open_set_test_dataset, batch_size=1024, shuffle=False, pin_memory=True
+        )
 
     train_classifier_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=128, 
-        shuffle=True, num_workers=opt.num_workers,
-        pin_memory=True, sampler=None)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True, drop_last=True)
-    close_set_test_loader = torch.utils.data.DataLoader(close_set_test_dataset, batch_size=opt.batch_size, shuffle=False, pin_memory=True)
+        train_dataset, batch_size=128, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=opt.batch_size, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True, drop_last=True
+    )
+    close_set_test_loader = torch.utils.data.DataLoader(
+        close_set_test_dataset, batch_size=1024, shuffle=False, pin_memory=True
+    )
 
-    return train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader
-
+    return train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader, support_oe_loader
 
 def set_model(opt):
     model = ConTinyMPNCOVResNet(
@@ -191,14 +239,9 @@ def set_model(opt):
         input_size=64,
         feat_dim=128
     )
-    # criterion = SupConLoss(temperature=0.07)
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = SupConLoss(temperature=0.07)
     criterion_classifier = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     classifier = LinearClassifier(input_dim=8256, num_classes=opt.n_classes)
-
-    # if torch.cuda.is_available():
-    #     if torch.cuda.device_count() > 1:
-    #         model = torch.nn.DataParallel(model, device_ids=[0])
         
     model = model.to(opt.device)
     criterion = criterion.to(opt.device)
@@ -239,161 +282,165 @@ def set_optimizer(opt, model, class_str='', optim_choice='SGD'):
 
     return optimizer
 
-def train_gan(train_loader, model, generator, discriminator, classifier, criterion,
-              optimizer, optimizer_G, optimizer_D,
-              epoch, opt, step, latent_dim=128, gan_weight=0.1, lambda_gp=10.0):
+def train(train_loader, support_oe_loader, proto_tracker, model, classifier, criterion, optimizer, epoch, opt, step, enable_oe=False):
     model.train()
-    generator.train()
-    discriminator.train()
     classifier.train()
-    
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
-    loss_triplet_meter = AverageMeter()
-    loss_gan_g_meter = AverageMeter()
-    loss_d_meter = AverageMeter()
-    alpha = 0.5  # Weight for pairwise loss
-    # triplet_loss_fn = TripletMarginLoss(margin=1.0, p=2)
+    loss_dict_avg = {
+        'supcon': AverageMeter(),
+        'fdef': AverageMeter(),
+        'tightness': AverageMeter(),
+        'push_oe': AverageMeter()
+    }
 
     end = time.time()
+    oe_iter = iter(support_oe_loader)
 
     for idx, (images, labels) in enumerate(train_loader):
         step += 1
         data_time.update(time.time() - end)
 
-        images = images.to(opt.device, non_blocking=True)
-        labels = labels.to(opt.device, non_blocking=True)
+        image1, image2 = images[0].to(opt.device), images[1].to(opt.device)
+        bsz = labels.size(0)
+        labels = labels.to(opt.device)
+
+        if epoch == 1 and idx == 0:
+            print(f"Shape: {torch.cat([image1, image2], dim=0).shape}")
+            sample_0 = image1[0]
+            for ch in range(sample_0.shape[0]):
+                print(f"\n=== Channel {ch} ===")
+                print(sample_0[ch][:5, :5])
 
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
-        # ======= 1. ENCODER: Triplet Loss =======
-        feats = model.encoder(images)
-        if torch.isnan(feats).any() or torch.isinf(feats).any():
-            print("[Warning] NaN/Inf in encoder output, skipping batch")
-            continue
-        feats = F.normalize(feats, dim=1)
-        logits = classifier(feats)
+        # === Update prototype if not frozen ===
+        with torch.no_grad():
+            feats = model.encoder(image1)
+            if not proto_tracker.is_frozen():
+                proto_tracker.update(feats.detach(), labels)
 
-        # Combine losses
-        loss_ce = criterion(logits, labels)
-        loss_pw = pairwise_loss_v2(feats, labels)
+        if not enable_oe:
+            # ---- SupCon + F-DEF Phase ----
+            images = torch.cat([image1, image2], dim=0)
+            features = model.encoder(images)
+            features = F.normalize(features, dim=1)
 
-        loss_enc = alpha * loss_pw + (1 - alpha) * loss_ce
-        loss_enc.backward()
+            f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+            supcon_features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+
+            loss_supcon = criterion(supcon_features, labels)
+            all_features = torch.cat([f1, f2], dim=0)
+            all_labels = torch.cat([labels, labels], dim=0)
+            loss_fdef = fdef_loss(all_features, all_labels)
+
+            alpha, beta = 1.0, 1.5
+            loss = alpha * loss_supcon + beta * loss_fdef
+            loss_dict = {
+                'supcon': loss_supcon.item(),
+                'fdef': loss_fdef.item(),
+                'tightness': 0.0,
+                'push_oe': 0.0
+            }
+
+        else:
+            # ---- OE Phase: OpSupConLoss ----
+            x_oe, y_oe, oe_iter = get_next_oe_batch(oe_iter, support_oe_loader, opt.device)
+
+            images_all = torch.cat([image1, x_oe], dim=0)
+            images_all_aug = torch.cat([image2, x_oe], dim=0)
+            labels_all = torch.cat([labels, y_oe], dim=0)
+
+            z1 = model.encoder(images_all)
+            z2 = model.encoder(images_all_aug)
+            features = torch.stack([z1, z2], dim=0)
+            features = F.normalize(features, dim=1)
+            prototypes = proto_tracker.get_prototypes()
+
+            # Gradual warmup for OE loss
+            lambda_oh = opt.lambda_oh * min(1.0, (epoch - opt.warmup_epoch) / 5)
+
+            loss, loss_dict = opsupcon_loss(
+                features=features,
+                labels=labels_all,
+                prototypes=prototypes,
+                temperature=0.09,
+                margin=opt.margin,
+                lambda_pe=opt.lambda_pe,
+                lambda_oh=lambda_oh
+            )
+
+        # === Backward ===
         optimizer.zero_grad()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        loss.backward()
         optimizer.step()
 
-        # ======= 2. DISCRIMINATOR: WGAN-GP =======
-        real_feats = feats.detach()
-        z = torch.randn(images.size(0), latent_dim).to(opt.device)
-        fake_feats = generator(z).detach()
-        fake_feats = F.normalize(fake_feats, dim=1)
+        # === Update meters ===
+        losses.update(loss.item(), bsz)
+        for key in loss_dict:
+            loss_dict_avg[key].update(loss_dict[key], bsz)
 
-        d_real = discriminator(real_feats)
-        d_fake = discriminator(fake_feats)
-        loss_d = loss_discriminator_wgan_gp(d_real, d_fake)
-
-        # Gradient penalty
-        gp = gradient_penalty(discriminator, real_feats, fake_feats, device=opt.device, lambda_gp=lambda_gp)
-
-        loss_d_total = loss_d + lambda_gp * gp
-
-        optimizer_D.zero_grad()
-        loss_d_total.backward()
-        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=5.0)
-        optimizer_D.step()
-
-        # ======= 3. GENERATOR =======
-        z = torch.randn(images.size(0), latent_dim).to(opt.device)
-        fake_feats = generator(z)
-        fake_feats = F.normalize(fake_feats, dim=1)
-        g_fake = discriminator(fake_feats)
-        loss_g = loss_generator_wgan_gp(g_fake)
-
-        optimizer_G.zero_grad()
-        loss_g.backward()
-        torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=5.0)
-        optimizer_G.step()
-
-        # ======= Logging =======
-        total_loss = loss_enc.item() + gan_weight * (loss_g.item() + loss_d.item())
-        losses.update(total_loss, images.size(0))
-        loss_triplet_meter.update(loss_enc.item(), images.size(0))
-        loss_gan_g_meter.update(loss_g.item(), images.size(0))
-        loss_d_meter.update(loss_d.item(), images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
         if (idx + 1) % opt.print_freq == 0:
-            log_message = (
-                'Train: [{0}][{1}/{2}]\t'
-                'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                'Loss Total {loss.val:.4f} ({loss.avg:.4f}) | '
-                'Triplet {lpw.val:.4f} ({lpw.avg:.4f}) | '
-                'GAN_G {lgan.val:.4f} ({lgan.avg:.4f}) | '
-                'GAN_D {ld.val:.4f} ({ld.avg:.4f})\n'.format(
-                    epoch, idx + 1, len(train_loader),
-                    batch_time=batch_time,
-                    data_time=data_time,
-                    loss=losses,
-                    lpw=loss_triplet_meter,
-                    lgan=loss_gan_g_meter,
-                    ld=loss_d_meter
-                )
-            )
-            print(log_message)
+            print(f'Train: [{epoch}][{idx + 1}/{len(train_loader)}]  '
+                  f'Loss {losses.avg:.3f} | SupCon {loss_dict_avg["supcon"].avg:.3f} | '
+                  f'F-DEF {loss_dict_avg["fdef"].avg:.3f} | '
+                  f'Tight {loss_dict_avg["tightness"].avg:.3f} | PushOE {loss_dict_avg["push_oe"].avg:.3f}')
             sys.stdout.flush()
 
     return step, losses.avg
 
 
 
-def train_classifier(train_loader, model, classifier, criterion, optimizer, epoch, opt, step, logger):
+def train_classifier(train_loader, model, classifier, optimizer, epoch, opt, step, logger):
     model.eval()
     classifier.train()
 
     losses = AverageMeter()
     accs = AverageMeter()
 
-    # Start the training loop
     end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
         step += 1
+        images = images[0]
         images = images.to(opt.device, non_blocking=True)
         labels = labels.to(opt.device, non_blocking=True)
-        bsz = labels.size(0)  # Batch size
+        bsz = labels.size(0)
 
-        # Extract features from the pre-trained model in evaluation mode
+        # === 1. Extract features from the encoder ===
         with torch.no_grad():
             features = model.encoder(images)
-            
-        # Forward pass through the classifier
-        output = classifier(features.detach())
 
-        # Compute loss
-        loss = criterion(output, labels)
+        # === 2. Predict logits with classifier ===
+        features = F.normalize(features, dim=1)
+        logits = classifier(features.detach())
+
+        # === 3. Compute C-DEF Loss ===
+        ce_loss = F.cross_entropy(logits, labels)
+        cdef = cdef_loss(logits, labels, margin=0.5)
+        loss = ce_loss + 0.1 * cdef
+
         losses.update(loss.item(), bsz)
 
-        # Compute accuracy
-        acc = accuracy(output, labels, topk=(1,))
+        # === 4. Accuracy for monitoring ===
+        acc = accuracy(logits, labels, topk=(1,))
         accs.update(acc[0].item(), bsz)
 
-        # Backward pass and optimization step
+        # === 5. Backward and optimize ===
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Log loss and accuracy to TensorBoard every opt.print_freq steps
+        # === 6. Logging ===
         if step % opt.print_freq == 0:
             logger.add_scalar('loss/train', losses.avg, step)
             logger.add_scalar('accuracy/train', accs.avg, step)
 
-    # Return the updated step count, average loss, and average accuracy
     return step, losses.avg, accs.avg
-
 
 def validate_closed_set(val_loader, model, classifier, criterion, opt):
     model.eval()
@@ -412,7 +459,8 @@ def validate_closed_set(val_loader, model, classifier, criterion, opt):
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
 
-            features = model.encoder(images)         # 👉 Extract features
+            features = model.encoder(images)    
+            features = F.normalize(features, dim=1)  # Normalize features
             outputs = classifier(features)           # 👉 Classify
 
             loss = criterion(outputs, labels)
@@ -437,14 +485,14 @@ def find_best_threshold(y_true, unk_probs):
     best_idx = np.argmax(j_scores)
     return thresholds[best_idx], fpr[best_idx], tpr[best_idx]
 
-def validate_open_set(val_loader, model, opt, class_means, weibull_models, classifier=None):
+def validate_open_set(val_loader, model, opt, class_means, weibull_models, class_inv_covs, classifier=None):
     model.eval()
     if classifier is not None:
         classifier.eval()
 
     total_preds = []
+    total_labels = []
     unk_probs = []
-    valid_labels = []
 
     with torch.no_grad():
         progress_bar = tqdm(val_loader, file=sys.stdout, disable=not sys.stdout.isatty())
@@ -454,54 +502,31 @@ def validate_open_set(val_loader, model, opt, class_means, weibull_models, class
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
 
-            # ----- Extract embedding -----
-            if classifier is not None:
-                feats = model.encoder(images)  # [B, feat_dim]
-            else:
-                feats = model(images)          # [B, feat_dim]
-
+            # --- Use projection head embedding ---
+            feats = model(images)  # [B, feat_dim]
             feats = F.normalize(feats, dim=1)
+
             feats_np = feats.cpu().numpy()
 
-            # ----- Predict via RD-OpenMax -----
+            # ----- Dự đoán với OpenMax -----
             for f, label in zip(feats_np, labels.cpu().numpy()):
-                if not np.all(np.isfinite(f)):
-                    # print(f"[Skip] Non-finite embedding for label {label}")
-                    continue
-                try:
-                    pred_class, unk_prob = openmax_predict_rd(f, class_means, weibull_models)
-                except (KeyError, ValueError, ZeroDivisionError, FloatingPointError) as e:
-                    # print(f"[Skip] Sample with error: {e}")
-                    continue
-
+                pred_class, unk_prob = openmax_predict_mahalanobis(f, class_means, class_inv_covs, weibull_models)
                 total_preds.append((pred_class, unk_prob))
+                total_labels.append(label)
                 unk_probs.append(unk_prob)
-                valid_labels.append(label)
 
-    if len(total_preds) == 0:
-        # print("[Error] No valid predictions available!")
-        return 0, 0, 0, 0, 0, np.zeros((2, 2))
-
-    # Convert to numpy arrays
-    unk_probs = np.array(unk_probs)
-    valid_labels = np.array(valid_labels)
-
-    # Map: 0 = known, 1 = unknown
+    # Mapping: 0 -> known, 1 -> unknown
     known_label = getattr(opt, 'known_class_label', 0)
-    mapped_label = np.array([0 if l == known_label else 1 for l in valid_labels])
+    mapped_label = [0 if l == known_label else 1 for l in total_labels]
 
-    # Find optimal threshold
-    fpr, tpr, thresholds = roc_curve(mapped_label, unk_probs)
-    best_idx = np.argmax(tpr - fpr)
-    best_thresh = thresholds[best_idx]
-    best_fpr = fpr[best_idx]
-    best_tpr = tpr[best_idx]
-
+    # Tìm ngưỡng tối ưu
+    best_thresh, best_fpr, best_tpr = find_best_threshold(mapped_label, unk_probs)
     print(f'>>> Best Threshold = {best_thresh:.4f} | FPR: {best_fpr:.4f} | TPR: {best_tpr:.4f}')
 
-    # Apply threshold
+    # Phân loại theo ngưỡng
     mapped_pred = [0 if p[1] < best_thresh else 1 for p in total_preds]
 
+    # Tính chỉ số hiệu suất
     acc = accuracy_score(mapped_label, mapped_pred) * 100
     f1 = f1_score(mapped_label, mapped_pred, average='binary')
     precision = precision_score(mapped_label, mapped_pred, average='binary', zero_division=0)
@@ -538,24 +563,13 @@ def main():
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     # === Data Loader ===
-    train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader = set_loader(opt)
+    train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader, support_oe_loader = set_loader(opt)
 
     # === Model ===
     model, criterion, classifier, criterion_classifier = set_model(opt)
 
-    latent_dim = 128
-    out_dim = 8256  # phải bằng với output của model.encoder(images)
-
-    generator = Generator(latent_dim=latent_dim, out_dim=out_dim).to(opt.device)
-    discriminator = Discriminator(input_dim=out_dim).to(opt.device)
     # === Optimizer ===
     optimizer = set_optimizer(opt, model, optim_choice=opt.optimizer)
-
-    # Generator: Adam
-    optimizer_G = torch.optim.Adam(generator.parameters(), lr=1e-4, betas=(0.0, 0.9))
-    # Discriminator (Critic): Adam
-    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=1e-4, betas=(0.0, 0.9))
-
     optimizer_classifier = set_optimizer(opt, classifier, class_str='_classifier', optim_choice=opt.optimizer)
 
     logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
@@ -563,18 +577,35 @@ def main():
 
     start_epoch = 1
     step = 0
+    enable_oe = False
+    proto_tracker = PrototypeTracker(
+        num_classes=opt.n_classes,
+        feat_dim=8256,            
+        device=opt.device,
+        momentum=0.9
+    )
 
     for epoch in range(start_epoch, opt.epochs + 1):
         print(f'=== Epoch {epoch} | Time: {time.strftime("%Y-%m-%d %H:%M:%S")} ===')
         adjust_learning_rate(opt, optimizer, epoch)
 
         # === Training ===
-        step, train_loss = train_gan(train_loader, model, generator, discriminator, classifier, criterion,
-                   optimizer, optimizer_G, optimizer_D,
-                   epoch, opt, step, gan_weight=1.0)
-        print(f'Epoch {epoch}, Train SupCon Loss: {train_loss:.4f}')
+        # step, train_loss = train(train_loader, support_oe_loader, proto_tracker, model, classifier, criterion, optimizer, epoch, opt, step)
+        step, train_loss = train(train_loader, support_oe_loader, proto_tracker, model, classifier, criterion, optimizer, epoch, opt, step, enable_oe)
+        print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}')
+
+        # === Prototype stability ===
+        proto_shift = proto_tracker.compute_shift()
+        print(f"[Epoch {epoch}] 🔄 Prototype shift = {proto_shift:.6f}")
+
+        if epoch >= opt.warmup_epoch and proto_shift < opt.proto_shift_thresh:
+            if not proto_tracker.is_frozen():
+                enable_oe = True
+            proto_tracker.freeze()
+            print(f"✅ Prototype frozen at epoch {epoch} (Δ = {proto_shift:.6f})")
+
         sys.stdout.flush()
-        log_writer.write(f'Epoch: {epoch}, Train SupCon Loss: {train_loss:.4f}\n')
+        log_writer.write(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}\n')
         
         # === Validation ===
         if epoch % opt.save_freq == 0:
@@ -582,7 +613,7 @@ def main():
             print("------------Train classifier...------------")
             adjust_learning_rate(opt, optimizer_classifier, epoch, '_classifier')
             new_step, loss_ce, train_acc = train_classifier(train_classifier_loader, model, classifier, 
-                                                            criterion_classifier, optimizer_classifier, epoch, opt, step, logger)
+                                                            optimizer_classifier, epoch, opt, step, logger)
             print(f'Epoch {epoch}, Train Classifier Loss: {loss_ce:.4f} | Train Acc: {train_acc:.2f}')
 
             print("------------Validating on closed-set...------------")
@@ -598,17 +629,19 @@ def main():
             if opt.test_contains_unknown:
                 print("------------Fitting Weibull models...------------")
                 sys.stdout.flush()
-                class_feats, class_means = extract_class_stats(model, classifier, train_loader, opt.device)
-                weibull_models = fit_weibull_rd(class_feats, class_means, tailsize=50)
+                
+                class_feats, class_means, class_inv_covs = extract_class_stats_mahalanobis(model, classifier, train_loader, opt.device)
+                weibull_models = fit_weibull_mahalanobis(class_feats, class_means, class_inv_covs)
 
                 with open(os.path.join(opt.save_folder, f'weibull_epoch_{epoch}.pkl'), 'wb') as f:
                     pickle.dump({
                         'class_means': class_means,
-                        'weibull_models': weibull_models
+                        'weibull_models': weibull_models,
+                        'class_inv_covs': class_inv_covs
                     }, f)
                 print("------------Validating with RD-OpenMax...------------")
                 val_loss_open, val_acc_open, val_f1_open, precision_open, recall_open, conf_matrix_open = validate_open_set(
-                    open_set_test_loader, model, opt, class_means, weibull_models, classifier
+                    open_set_test_loader, model, opt, class_means, weibull_models, class_inv_covs, classifier
                 )
                 print(f'Open-set Results:\nAcc: {val_acc_open:.2f} | F1: {val_f1_open:.4f} | '
                     f'Precision: {precision_open:.4f} | Recall: {recall_open:.4f}')
@@ -619,7 +652,7 @@ def main():
         # === Save Checkpoint ===
         if epoch % opt.save_freq == 0:
             save_path = os.path.join(opt.save_folder, f'ckpt_epoch_{epoch}.pth')
-            save_model(model, optimizer, opt, epoch, save_path)
+            save_model(model, optimizer, opt, epoch, save_path, proto_tracker=proto_tracker)
 
             save_path_classifier = os.path.join(opt.save_folder, f'ckpt_classifier_epoch_{epoch}.pth')
             save_model(classifier, optimizer_classifier, opt, epoch, save_path_classifier)  

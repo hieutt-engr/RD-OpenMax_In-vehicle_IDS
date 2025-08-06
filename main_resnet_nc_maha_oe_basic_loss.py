@@ -9,6 +9,7 @@ from sklearn.metrics import roc_curve
 
 import sys
 import time
+from confusion_pytorch import PairwiseConfusion
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -19,12 +20,13 @@ import pickle
 
 import pprint
 from torchvision import transforms
-from dataset import CANDatasetEnet as CANDataset
-from losses import SupConLoss, cdef_loss, fdef_loss, oe_loss_mix
-from util import AverageMeter, AddGaussianNoise, TwoCropTransform, create_pseudo_unknown
-from rd_openmax import fit_weibull_rd, openmax_predict_rd, extract_class_stats
+from dataset import CANDatasetEnet as CANDataset, OEOfflineDataset
+from losses import SupConLoss, cdef_loss, fdef_loss, opsupcon_loss, opsupcon_loss_single_view
+from util import AverageMeter, AddGaussianNoise, PrototypeTracker, RandomPatchShuffle, TwoCropTransform, get_next_oe_batch
+from rd_openmax_maha import openmax_predict_mahalanobis, extract_class_stats_mahalanobis, fit_weibull_mahalanobis
 from util import warmup_learning_rate
 from util import save_model, accuracy
+from torch.utils.data import DataLoader
 from networks.con_mpncovresnet import ConTinyMPNCOVResNet , LinearClassifier
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, accuracy_score
 from torch.utils.tensorboard import SummaryWriter
@@ -35,7 +37,7 @@ def parse_option():
 
     parser.add_argument('--print_freq', type=int, default=100,
                         help='print frequency')
-    parser.add_argument('--save_freq', type=int, default=1,
+    parser.add_argument('--save_freq', type=int, default=5,
                         help='save frequency')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='batch_size')
@@ -45,6 +47,17 @@ def parse_option():
                         help='number of training epochs')
     parser.add_argument('--resume', type=str, default=None, 
                         help='path to the checkpoint to resume from')
+    # OE setting
+    parser.add_argument('--warmup_epoch', type=int, default=60,
+                        help='number of warmup epochs for close-set training')
+    parser.add_argument('--lambda_pe', type=float, default=0.1,
+                        help='weight for tightness loss')
+    parser.add_argument('--lambda_oh', type=float, default=0.2,
+                        help='weight for pushOE loss (after warmup)')
+    parser.add_argument('--proto_shift_thresh', type=float, default=0.05,
+                        help='prototype shift threshold')
+    parser.add_argument('--margin', type=float, default=0.4,
+                        help='margin for contrastive loss')
     
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.03,
@@ -57,6 +70,7 @@ def parse_option():
                         help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum')
+    
     # optimization classifier
     parser.add_argument('--epoch_start_classifier', type=int, default=90)
     parser.add_argument('--learning_rate_classifier', type=float, default=0.01,
@@ -86,6 +100,8 @@ def parse_option():
                         help='path to custom dataset')
     parser.add_argument('--open_set_test_data', type=str, default=None,
                     help='Path to additional test data (for RD-OpenMax)')
+    parser.add_argument('--oe_data_root', type=str, default=None,
+                    help='Path to the root directory of the OE dataset')
     parser.add_argument('--n_classes', type=int, default=6, 
                         help='number of class')
 
@@ -114,6 +130,7 @@ def parse_option():
     opt = parser.parse_args()
 
     opt.device = torch.device('cuda:0')
+
 
     opt.model_path = './save/{}_models/{}'.format(opt.dataset, opt.method)
     iterations = opt.lr_decay_epochs.split(',')
@@ -162,25 +179,60 @@ def set_loader(opt):
     train_transform = transforms.Compose([
         transforms.RandomApply([AddGaussianNoise(0., 0.05)], p=0.5),
         transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
-        transforms.Normalize(mean=mean, std=std)
+        normalize
     ])
-    # Khởi tạo dataset
-    train_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=True, transform=TwoCropTransform(train_transform))
-    close_set_test_dataset = CANDataset(root_dir=opt.close_set_test_data, window_size=32, is_train=False, transform=transform)
+
+    # Dataset
+    train_dataset = CANDataset(
+        root_dir=opt.data_folder, window_size=32, is_train=True,
+        transform=train_transform
+    )
+    close_set_test_dataset = CANDataset(
+        root_dir=opt.close_set_test_data, window_size=32,
+        is_train=False, transform=transform
+    )
+
+    # transform_oe = transforms.Compose([
+    #     transforms.RandomApply([RandomPatchShuffle(num_patches=4)], p=0.7),
+    #     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.3, 1.5))], p=0.5),
+    #     transforms.RandomApply([transforms.RandomErasing(scale=(0.02, 0.2))], p=0.3),
+    #     transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
+    # ])
+
+    support_oe_dataset = OEOfflineDataset(
+        tfrecord_path=opt.oe_data_root,
+        target_size=64,
+        transform=transform
+    )
+
+    support_oe_loader = torch.utils.data.DataLoader(
+        support_oe_dataset, batch_size=128, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True
+    )
 
     open_set_test_loader = None
     if opt.open_set_test_data:
-        open_set_test_dataset = CANDataset(root_dir=opt.open_set_test_data, window_size=32, is_train=False, transform=transform)
-        open_set_test_loader = torch.utils.data.DataLoader(open_set_test_dataset, batch_size=1024, shuffle=False,  pin_memory=True)
+        open_set_test_dataset = CANDataset(
+            root_dir=opt.open_set_test_data, window_size=32,
+            is_train=False, transform=transform
+        )
+        open_set_test_loader = torch.utils.data.DataLoader(
+            open_set_test_dataset, batch_size=1024, shuffle=False, pin_memory=True
+        )
 
     train_classifier_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=128, 
-        shuffle=True, num_workers=opt.num_workers,
-        pin_memory=True, sampler=None)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True, drop_last=True)
-    close_set_test_loader = torch.utils.data.DataLoader(close_set_test_dataset, batch_size=1024, shuffle=False, pin_memory=True)
+        train_dataset, batch_size=128, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=opt.batch_size, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True, drop_last=True
+    )
+    close_set_test_loader = torch.utils.data.DataLoader(
+        close_set_test_dataset, batch_size=1024, shuffle=False, pin_memory=True
+    )
 
-    return train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader
+    return train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader, support_oe_loader
 
 def set_model(opt):
     model = ConTinyMPNCOVResNet(
@@ -188,7 +240,7 @@ def set_model(opt):
         input_size=64,
         feat_dim=128
     )
-    criterion = SupConLoss(temperature=0.07)
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_classifier = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     classifier = LinearClassifier(input_dim=8256, num_classes=opt.n_classes)
         
@@ -231,76 +283,110 @@ def set_optimizer(opt, model, class_str='', optim_choice='SGD'):
 
     return optimizer
 
-def train(train_loader, model, criterion, optimizer, epoch, opt, step, unk_feats):
-    """Stage 1: Training encoder with SupCon + F-DEF loss"""
+def train(train_loader, support_oe_loader, proto_tracker, model, classifier, criterion, optimizer, epoch, opt, step, enable_oe=False):
     model.train()
+    classifier.train()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
-    losses_oe = AverageMeter()
+    loss_dict_avg = {
+        'supcon': AverageMeter(),
+        'pairwise': AverageMeter(),
+        'tightness': AverageMeter(),
+        'push_oe': AverageMeter()
+    }
 
     end = time.time()
+    oe_iter = iter(support_oe_loader)
 
     for idx, (images, labels) in enumerate(train_loader):
         step += 1
         data_time.update(time.time() - end)
 
-        image1, image2 = images[0], images[1]
-        images = torch.cat([image1, image2], dim=0)
-
         images = images.to(opt.device, non_blocking=True)
         labels = labels.to(opt.device, non_blocking=True)
-        bsz = labels.shape[0]
 
-        # Warm-up learning rate
+        if epoch == 1 and idx == 0:
+            print(f"Shape: {images.shape}")
+            sample_0 = images[0]
+            for ch in range(sample_0.shape[0]):
+                print(f"\n=== Channel {ch} ===")
+                print(sample_0[ch][:5, :5])
+
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
-        # --- Forward ---
-        features = model.encoder(images)
-        features = F.normalize(features, dim=1)
+        # === Update prototype if not frozen ===
+        with torch.no_grad():
+            feats = model.encoder(images)
+            if not proto_tracker.is_frozen():
+                proto_tracker.update(feats.detach(), labels)
 
-        f1, f2 = torch.split(features, [bsz, bsz], dim=0)
-        supcon_features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+        if not enable_oe:
+            # ---- CE + Pairwise ----
+            features = model.encoder(images)
+            features = F.normalize(features, dim=1)
+            logits = classifier(features)
+            loss = criterion(logits, labels)
 
-        # --- SupCon loss ---
-        loss_supcon = criterion(supcon_features, labels)
+            loss += 10 * PairwiseConfusion(images)
 
-        # --- F-DEF loss ---
-        all_features = torch.cat([f1, f2], dim=0)
-        all_labels = torch.cat([labels, labels], dim=0)
-        loss_fdef = fdef_loss(all_features, all_labels)
-        # Combine
-        alpha = 1.0  # weight for SupCon, tune if needed
-        beta = 1.5  # weight for F-DEF  #old => 1.5
-        loss = alpha * loss_supcon + beta * loss_fdef
-        # Update
-        losses.update(loss.item(), bsz)
+            loss_dict = {
+                'supcon': 0.0,
+                'pairwise': loss.item(),
+                'tightness': 0.0,
+                'push_oe': 0.0
+            }
 
+        else:
+            # ---- OE Phase: OpSupConLoss ----
+            x_oe, y_oe, oe_iter = get_next_oe_batch(oe_iter, support_oe_loader, opt.device)
+
+            images_all = torch.cat([images, x_oe], dim=0)
+            labels_all = torch.cat([labels, y_oe], dim=0)
+
+            features = model.encoder(images_all)
+            features = F.normalize(features, dim=1)
+            prototypes = proto_tracker.get_prototypes()
+
+            # Gradual warmup for OE loss
+            lambda_oh = opt.lambda_oh * min(1.0, (epoch - opt.warmup_epoch) / 5)
+
+            loss, loss_dict = opsupcon_loss_single_view(
+                features=features,
+                labels=labels_all,
+                prototypes=prototypes,
+                temperature=0.09,
+                margin=opt.margin,
+                lambda_pe=opt.lambda_pe,
+                lambda_oh=lambda_oh
+            )
+
+        # === Backward ===
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # === Update meters ===
+        losses.update(loss.item(), images.size(0))
+        for key in loss_dict:
+            loss_dict_avg[key].update(loss_dict[key], images.size(0))
 
         batch_time.update(time.time() - end)
         end = time.time()
 
         if (idx + 1) % opt.print_freq == 0:
-            log_message = (
-                'Train: [{0}][{1}/{2}]\t'
-                'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                'loss  {loss.val:.3f} ({loss.avg:.3f})\t'
-                'loss_oe {loss_oe.val:.4f} ({loss_oe.avg:.4f})\n'.format(
-                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, loss=losses, loss_oe=losses_oe
-                )
-            )
-            print(log_message)
+            print(f'Train: [{epoch}][{idx + 1}/{len(train_loader)}]  '
+                  f'Loss {losses.avg:.3f} | SupCon {loss_dict_avg["supcon"].avg:.3f} | '
+                  f'Pairwise {loss_dict_avg["pairwise"].avg:.3f} | '
+                  f'Tight {loss_dict_avg["tightness"].avg:.3f} | PushOE {loss_dict_avg["push_oe"].avg:.3f}')
             sys.stdout.flush()
 
     return step, losses.avg
 
-def train_classifier(train_loader, model, classifier, optimizer, epoch, opt, step, logger, scale_pos=1.0, scale_neg=1.0):
+
+
+def train_classifier(train_loader, model, classifier, optimizer, criterion, epoch, opt, step, logger):
     model.eval()
     classifier.train()
 
@@ -310,7 +396,7 @@ def train_classifier(train_loader, model, classifier, optimizer, epoch, opt, ste
     end = time.time()
     for idx, (images, labels) in enumerate(train_loader):
         step += 1
-        images = images[0]
+        # images = images[0]
         images = images.to(opt.device, non_blocking=True)
         labels = labels.to(opt.device, non_blocking=True)
         bsz = labels.size(0)
@@ -318,14 +404,14 @@ def train_classifier(train_loader, model, classifier, optimizer, epoch, opt, ste
         # === 1. Extract features from the encoder ===
         with torch.no_grad():
             features = model.encoder(images)
-
+            features = F.normalize(features, dim=1)
         # === 2. Predict logits with classifier ===
         logits = classifier(features.detach())
 
         # === 3. Compute C-DEF Loss ===
-        ce_loss = F.cross_entropy(logits, labels)
-        cdef = cdef_loss(logits, labels, margin=0.5)
-        loss = ce_loss + 0.1 * cdef
+        loss = criterion(logits, labels)
+        # cdef = cdef_loss(logits, labels, margin=0.5)
+        # loss = ce_loss + 0.1 * cdef
 
         losses.update(loss.item(), bsz)
 
@@ -364,7 +450,8 @@ def validate_closed_set(val_loader, model, classifier, criterion, opt):
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
 
-            features = model.encoder(images)         # 👉 Extract features
+            features = model.encoder(images)
+            features = F.normalize(features, dim=1)
             outputs = classifier(features)           # 👉 Classify
 
             loss = criterion(outputs, labels)
@@ -389,7 +476,7 @@ def find_best_threshold(y_true, unk_probs):
     best_idx = np.argmax(j_scores)
     return thresholds[best_idx], fpr[best_idx], tpr[best_idx]
 
-def validate_open_set(val_loader, model, opt, class_means, weibull_models, classifier=None):
+def validate_open_set(val_loader, model, opt, class_means, weibull_models, class_inv_covs, classifier=None):
     model.eval()
     if classifier is not None:
         classifier.eval()
@@ -406,18 +493,15 @@ def validate_open_set(val_loader, model, opt, class_means, weibull_models, class
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
 
-            # ----- Lấy feature embedding -----
-            if classifier is not None:
-                feats = model.encoder(images)  # [B, feat_dim]
-            else:
-                feats = model(images)          # [B, feat_dim]
-
+            # --- Use projection head embedding ---
+            feats = model(images)  # [B, feat_dim]
             feats = F.normalize(feats, dim=1)
+
             feats_np = feats.cpu().numpy()
 
             # ----- Dự đoán với OpenMax -----
             for f, label in zip(feats_np, labels.cpu().numpy()):
-                pred_class, unk_prob = openmax_predict_rd(f, class_means, weibull_models)
+                pred_class, unk_prob = openmax_predict_mahalanobis(f, class_means, class_inv_covs, weibull_models)
                 total_preds.append((pred_class, unk_prob))
                 total_labels.append(label)
                 unk_probs.append(unk_prob)
@@ -470,7 +554,7 @@ def main():
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     # === Data Loader ===
-    train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader = set_loader(opt)
+    train_loader, train_classifier_loader, close_set_test_loader, open_set_test_loader, support_oe_loader = set_loader(opt)
 
     # === Model ===
     model, criterion, classifier, criterion_classifier = set_model(opt)
@@ -479,23 +563,38 @@ def main():
     optimizer = set_optimizer(opt, model, optim_choice=opt.optimizer)
     optimizer_classifier = set_optimizer(opt, classifier, class_str='_classifier', optim_choice=opt.optimizer)
 
-    # OE LOAD
-    unk_feats_path = './data/set_04/test_03_known_vehicle_unknown_attack/preprocessed/oe_sample/precomputed_unk_feats.pt'
-    unk_feats = torch.load(unk_feats_path)
-
     logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
     log_writer = open(opt.log_file, 'w')
 
     start_epoch = 1
     step = 0
+    enable_oe = False
+    proto_tracker = PrototypeTracker(
+        num_classes=opt.n_classes,
+        feat_dim=8256,            
+        device=opt.device,
+        momentum=0.9
+    )
 
     for epoch in range(start_epoch, opt.epochs + 1):
         print(f'=== Epoch {epoch} | Time: {time.strftime("%Y-%m-%d %H:%M:%S")} ===')
         adjust_learning_rate(opt, optimizer, epoch)
 
         # === Training ===
-        step, train_loss = train(train_loader, model, criterion, optimizer, epoch, opt, step, unk_feats)
+        # step, train_loss = train(train_loader, support_oe_loader, proto_tracker, model, classifier, criterion, optimizer, epoch, opt, step)
+        step, train_loss = train(train_loader, support_oe_loader, proto_tracker, model, classifier, criterion, optimizer, epoch, opt, step, enable_oe)
         print(f'Epoch {epoch}, Train Loss: {train_loss:.4f}')
+
+        # === Prototype stability ===
+        proto_shift = proto_tracker.compute_shift()
+        print(f"[Epoch {epoch}] 🔄 Prototype shift = {proto_shift:.6f}")
+
+        if epoch >= opt.warmup_epoch and proto_shift < opt.proto_shift_thresh:
+            if not proto_tracker.is_frozen():
+                enable_oe = True
+            proto_tracker.freeze()
+            print(f"✅ Prototype frozen at epoch {epoch} (Δ = {proto_shift:.6f})")
+
         sys.stdout.flush()
         log_writer.write(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}\n')
         
@@ -505,7 +604,7 @@ def main():
             print("------------Train classifier...------------")
             adjust_learning_rate(opt, optimizer_classifier, epoch, '_classifier')
             new_step, loss_ce, train_acc = train_classifier(train_classifier_loader, model, classifier, 
-                                                            optimizer_classifier, epoch, opt, step, logger)
+                                                            optimizer_classifier, criterion_classifier, epoch, opt, step, logger)
             print(f'Epoch {epoch}, Train Classifier Loss: {loss_ce:.4f} | Train Acc: {train_acc:.2f}')
 
             print("------------Validating on closed-set...------------")
@@ -521,19 +620,19 @@ def main():
             if opt.test_contains_unknown:
                 print("------------Fitting Weibull models...------------")
                 sys.stdout.flush()
-                # class_feats, class_means, class_inv_covs = extract_class_stats_mahalanobis(model, classifier, train_loader, opt.device)
-                # weibull_models = fit_weibull_mahalanobis_mp(class_feats, class_means, class_inv_covs, tailsize=45)
-                class_feats, class_means = extract_class_stats(model, classifier, train_loader, opt.device)
-                weibull_models = fit_weibull_rd(class_feats, class_means, tailsize=45)
+                
+                class_feats, class_means, class_inv_covs = extract_class_stats_mahalanobis(model, classifier, train_loader, opt.device)
+                weibull_models = fit_weibull_mahalanobis(class_feats, class_means, class_inv_covs)
 
                 with open(os.path.join(opt.save_folder, f'weibull_epoch_{epoch}.pkl'), 'wb') as f:
                     pickle.dump({
                         'class_means': class_means,
-                        'weibull_models': weibull_models
+                        'weibull_models': weibull_models,
+                        'class_inv_covs': class_inv_covs
                     }, f)
                 print("------------Validating with RD-OpenMax...------------")
                 val_loss_open, val_acc_open, val_f1_open, precision_open, recall_open, conf_matrix_open = validate_open_set(
-                    open_set_test_loader, model, opt, class_means, weibull_models, classifier
+                    open_set_test_loader, model, opt, class_means, weibull_models, class_inv_covs, classifier
                 )
                 print(f'Open-set Results:\nAcc: {val_acc_open:.2f} | F1: {val_f1_open:.4f} | '
                     f'Precision: {precision_open:.4f} | Recall: {recall_open:.4f}')

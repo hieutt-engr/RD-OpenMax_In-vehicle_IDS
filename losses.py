@@ -353,101 +353,36 @@ def pairwise_loss(features, labels, margin=1.0):
 
     return (loss_same + loss_diff).mean()
 
-def pairwise_loss_v2(features, labels, margin=0.5, diff_weight=2.0):
-    batch_size = features.size(0)
-    if batch_size % 2 != 0:
-        raise ValueError("Batch size must be even")
-
-    left, right = torch.chunk(features, 2, dim=0)
-    label_left, label_right = torch.chunk(labels, 2, dim=0)
-
-    same_class = (label_left == label_right).float()
-    diff_class = 1 - same_class
-
-    distance = F.pairwise_distance(left, right)
-
-    loss_same = same_class * distance.pow(2)
-    loss_diff = diff_weight * diff_class * F.relu(margin - distance).pow(2)
-
-    return (loss_same + loss_diff).mean()
-
-# NC-OSR loss
-#Old => UniCon_CAN_TT_mpncovresnet50_lr_0.05_decay_0.0001_bsz_256_trial_2_cosine_warm
-
-# def fdef_loss(features: torch.Tensor, labels: torch.Tensor, temperature=0.1, margin=0.5):
+#New 
+### Loss này đang hoạt động tốt với 3 channel
+# def fdef_loss(features: torch.Tensor, labels: torch.Tensor, temperature=0.1, margin=0.3):
 #     """
-#     Feature Distance Enhancement Function (F-DEF) Loss
-#     - Encourages intra-class compactness and inter-class dispersion using cosine similarity.
-
-#     Args:
-#         features: Tensor [B, D] - normalized features
-#         labels: Tensor [B] - ground truth class labels
-#         temperature: float - scaling for similarity
-#         margin: float - minimum desired separation for different-class samples
-
-#     Returns:
-#         Scalar F-DEF loss
+#     Improved F-DEF Loss: cosine similarity + hard negative mining + margin
 #     """
-#     features = F.normalize(features, p=2, dim=1)
-#     sim_matrix = torch.matmul(features, features.T) / temperature  # [B, B]
+#     features = F.normalize(features, dim=1)
+#     sim_matrix = torch.matmul(features, features.T) / temperature
 
-#     labels = labels.view(-1, 1)  # [B, 1]
-#     mask = torch.eq(labels, labels.T).float()  # [B, B]
+#     labels = labels.view(-1, 1)
+#     mask = torch.eq(labels, labels.T).float()
 #     self_mask = torch.eye(labels.size(0), device=features.device)
 
-#     # Remove diagonal (self-comparison)
+#     # Remove self-comparison
 #     pos_mask = mask * (1 - self_mask)
-#     neg_mask = (1 - mask)
+#     neg_mask = (1 - mask) * (1 - self_mask)
 
-#     # Positive: encourage similarity close to 1
+#     # --- Positive Loss ---
 #     pos_sim = sim_matrix * pos_mask
 #     pos_loss = F.relu(1.0 - pos_sim).sum() / (pos_mask.sum() + 1e-6)
 
-#     # Negative: discourage similarity above margin
+#     # --- Negative Loss with hard mining ---
 #     neg_sim = sim_matrix * neg_mask
-#     neg_loss = F.relu(neg_sim - margin).sum() / (neg_mask.sum() + 1e-6)
+#     hard_neg = (neg_sim > margin).float() * neg_sim
+#     neg_loss = (hard_neg - margin).sum() / (neg_mask.sum() + 1e-6)
 
 #     return pos_loss + neg_loss
 
-
-# def cdef_loss(logits: torch.Tensor, labels: torch.Tensor, margin=0.5):
-#     """
-#     Classifier Distance Enhancement Function (C-DEF) Loss.
-#     - Encourages logit vectors to align with one-hot vectors and repel from others.
-
-#     Args:
-#         logits: Tensor [B, C] - raw logits (before softmax)
-#         labels: Tensor [B] - class labels
-
-#     Returns:
-#         Scalar C-DEF loss
-#     """
-#     logits = F.normalize(logits, p=2, dim=1)  # [B, C]
-#     B, C = logits.shape
-#     device = logits.device
-
-#     labels_one_hot = torch.zeros(B, C, device=device)
-#     labels_one_hot.scatter_(1, labels.unsqueeze(1), 1)
-#     labels_one_hot = F.normalize(labels_one_hot, dim=1)  # one-hot is sparse but norm
-
-#     # Positive alignment
-#     pos_sim = torch.sum(logits * labels_one_hot, dim=1)  # [B]
-#     pos_loss = F.relu(1.0 - pos_sim).mean()
-
-#     # Negative misalignment
-#     sim_matrix = torch.matmul(logits, labels_one_hot.T)  # [B, B]
-#     self_mask = torch.eye(B, device=device)
-#     neg_sim = sim_matrix * (1 - self_mask)
-#     neg_loss = F.relu(neg_sim - margin).sum() / (B * (B - 1))
-
-#     return pos_loss + neg_loss
-
-#New 
-
-def fdef_loss(features: torch.Tensor, labels: torch.Tensor, temperature=0.1, margin=0.2):
-    """
-    Improved F-DEF Loss: cosine similarity + hard negative mining + margin
-    """
+## Cải tiện 1 chút: thêm logsumexp để tránh chia nhỏ trị số:
+def fdef_loss(features, labels, temperature=0.1, margin=0.3):
     features = F.normalize(features, dim=1)
     sim_matrix = torch.matmul(features, features.T) / temperature
 
@@ -455,61 +390,59 @@ def fdef_loss(features: torch.Tensor, labels: torch.Tensor, temperature=0.1, mar
     mask = torch.eq(labels, labels.T).float()
     self_mask = torch.eye(labels.size(0), device=features.device)
 
-    # Remove self-comparison
     pos_mask = mask * (1 - self_mask)
     neg_mask = (1 - mask) * (1 - self_mask)
 
-    # --- Positive Loss ---
+    # Positive
     pos_sim = sim_matrix * pos_mask
     pos_loss = F.relu(1.0 - pos_sim).sum() / (pos_mask.sum() + 1e-6)
 
-    # --- Negative Loss with hard mining ---
+    # Negative: stable version
     neg_sim = sim_matrix * neg_mask
     hard_neg = (neg_sim > margin).float() * neg_sim
-    neg_loss = (hard_neg - margin).sum() / (neg_mask.sum() + 1e-6)
+    neg_loss = F.relu(hard_neg - margin).sum() / (neg_mask.sum() + 1e-6)
 
     return pos_loss + neg_loss
 
-# New version of fdef_loss with improved hard negative mining and margin handling 
 
-def fdef_loss_v2(features: torch.Tensor, labels: torch.Tensor, temperature=0.2, margin=0.2):
-    """
-    Improved F-DEF Loss: cosine similarity + hard negative mining + margin
-    """
-    # Ensure all tensors are on the same device
-    device = features.device
-    labels = labels.to(device)
+# def fdef_loss(features: torch.Tensor, labels: torch.Tensor, temperature=0.1, margin=0.3):
+#     """
+#     F-DEF loss implementation with cosine similarity, positive and hard negative pairs.
+    
+#     Args:
+#         features: Tensor of shape [2*B, D], stacked from two views (after encoder + projection)
+#         labels: Tensor of shape [2*B]
+#         temperature: Temperature scaling for cosine similarity
+#         margin: Margin threshold for selecting hard negatives
 
-    # Normalize features
-    features = F.normalize(features, dim=1)
+#     Returns:
+#         Scalar loss (positive + negative part)
+#     """
+#     device = features.device
+#     features = F.normalize(features, dim=1)  # L2 normalization
+#     sim_matrix = torch.matmul(features, features.T) / temperature  # Cosine similarity
+#     sim_matrix = torch.clamp(sim_matrix, -1.0, 1.0)
 
-    # Cosine similarity scaled by temperature
-    # sim_matrix = torch.matmul(features, features.T) / temperature
-    sim_matrix = torch.matmul(features, features.T).clamp(-1.0, 1.0) / temperature
+#     labels = labels.view(-1, 1)
+#     mask = torch.eq(labels, labels.T).float().to(device)
 
-    # Create masks
-    labels = labels.view(-1, 1)
-    mask = torch.eq(labels, labels.T).float().to(device)
-    self_mask = torch.eye(labels.size(0), device=device)
+#     self_mask = torch.eye(sim_matrix.size(0), device=device)
+#     pos_mask = mask * (1 - self_mask)  # Remove self-pair
+#     neg_mask = (1 - mask) * (1 - self_mask)
 
-    # Positive and negative masks
-    pos_mask = mask * (1 - self_mask)
-    neg_mask = (1 - mask) * (1 - self_mask)
+#     # --- Positive pairs ---
+#     pos_sim = sim_matrix[pos_mask.bool()]
+#     pos_loss = F.relu(1.0 - pos_sim).mean()
 
-    # --- Positive Loss ---
-    pos_sim = sim_matrix * pos_mask
-    pos_loss = F.relu(1.0 - pos_sim).sum() / (pos_mask.sum() + 1e-6)
+#     # --- Negative pairs with margin (hard negatives only) ---
+#     neg_sim = sim_matrix[neg_mask.bool()]
+#     hard_neg_sim = neg_sim[neg_sim > margin]
+#     if hard_neg_sim.numel() > 0:
+#         neg_loss = (hard_neg_sim - margin).mean()
+#     else:
+#         neg_loss = torch.tensor(0.0, device=device)
 
-    # --- Negative Loss with hard negative mining ---
-    neg_sim_values = sim_matrix[neg_mask.bool()]  # [N_neg]
-    if neg_sim_values.numel() > 0:
-        k = max(1, int(0.3 * len(neg_sim_values)))  # top 30% hardest
-        hard_neg_loss = F.relu(neg_sim_values - margin).topk(k).values.mean()
-    else:
-        hard_neg_loss = torch.tensor(0.0, device=device)
-
-    return pos_loss + hard_neg_loss
-
+#     return pos_loss + neg_loss
 
 
 def cdef_loss(logits: torch.Tensor, labels: torch.Tensor, margin=0.2):
@@ -537,3 +470,141 @@ def cdef_loss(logits: torch.Tensor, labels: torch.Tensor, margin=0.2):
     neg_loss = F.relu(neg_sim - margin).mean()
 
     return pos_loss + neg_loss
+
+def opsupcon_loss(features, labels, prototypes, temperature=0.1, margin=0.4, lambda_pe=0.1, lambda_oh=0.5):
+    """
+    OOD-aware SupCon loss = SupCon(ID) + Tightness(ID) + Push-away(OOD)
+    
+    Args:
+        features: [B, 2, D] (2 views per sample)
+        labels:   [B], where label = -1 for OE samples
+        prototypes: [C, D] class-wise normalized prototype
+    Returns:
+        loss_total
+    """
+    device = features.device
+    B = features.shape[0]
+    features = F.normalize(features, dim=2)  # [B, 2, D]
+    contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # [2B, D]
+    anchor_feature = contrast_feature
+    anchor_count = 2
+    logits = torch.div(torch.matmul(anchor_feature, contrast_feature.T), temperature)  # [2B, 2B]
+
+    labels = labels.contiguous().view(-1)
+    labels = torch.cat([labels, labels], dim=0)  # [2B]
+
+    # Build mask only for ID samples
+    mask = torch.eq(labels.unsqueeze(0), labels.unsqueeze(1)).float().to(device)  # [2B, 2B]
+
+    # Remove OE samples from positive pairs
+    invalid = (labels == -1)
+    mask[invalid, :] = 0
+    mask[:, invalid] = 0
+
+    # Compute SupCon Loss
+    logits_mask = torch.ones_like(mask).fill_diagonal_(0)
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-9)
+    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-9)
+
+    supcon_loss = -mean_log_prob_pos.mean()
+
+    # === Tightness Loss (PE) ===
+    if prototypes is not None:
+        with torch.no_grad():
+            norm_proto = F.normalize(prototypes, dim=1)
+        # Chỉ lấy các ID samples
+        idx_id = (labels != -1)
+        id_features = anchor_feature[idx_id]  # [M, D]
+        id_labels = labels[idx_id]            # [M]
+
+        proto_targets = norm_proto[id_labels.long()]  # [M, D]
+        loss_pe = (1 - F.cosine_similarity(id_features, proto_targets)).mean()
+    else:
+        loss_pe = torch.tensor(0.0, device=device)
+
+    # === OE Push Loss (OH) ===
+    with torch.no_grad():
+        norm_proto = F.normalize(prototypes, dim=1)
+
+    idx_oe = (labels == -1)
+    if idx_oe.any():
+        features_oe = anchor_feature[idx_oe]  # [K, D]
+        sim_oe = torch.matmul(F.normalize(features_oe, dim=1), norm_proto.T)  # [K, C]
+        max_sim = sim_oe.max(dim=1)[0]
+        loss_oh = F.relu(max_sim - margin).mean()
+    else:
+        loss_oh = torch.tensor(0.0, device=device)
+
+    # === Total Loss ===
+    loss_total = supcon_loss + lambda_pe * loss_pe + lambda_oh * loss_oh
+
+    return loss_total, {
+        'supcon': supcon_loss.item(),
+        'tightness': loss_pe.item(),
+        'push_oe': loss_oh.item()
+    }
+
+
+def opsupcon_loss_single_view(features, labels, prototypes, temperature=0.1, margin=0.4, lambda_pe=0.1, lambda_oh=0.5):
+    """
+    Modified version of opsupcon_loss to work with single-view features: [B, D]
+    """
+    device = features.device
+    B = features.shape[0]
+    features = F.normalize(features, dim=1)  # [B, D]
+
+    contrast_feature = features  # [B, D]
+    anchor_feature = features
+    anchor_count = 1  # only one view
+
+    logits = torch.div(torch.matmul(anchor_feature, contrast_feature.T), temperature)  # [B, B]
+
+    labels = labels.contiguous().view(-1)  # [B]
+
+    # Build mask only for ID samples
+    mask = torch.eq(labels.unsqueeze(0), labels.unsqueeze(1)).float().to(device)  # [B, B]
+
+    # Remove OE samples from positive pairs
+    invalid = (labels == -1)
+    mask[invalid, :] = 0
+    mask[:, invalid] = 0
+
+    # Compute SupCon Loss
+    logits_mask = torch.ones_like(mask).fill_diagonal_(0)
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-9)
+    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-9)
+    supcon_loss = -mean_log_prob_pos.mean()
+
+    # Tightness loss (PE)
+    if prototypes is not None:
+        with torch.no_grad():
+            norm_proto = F.normalize(prototypes, dim=1)
+        idx_id = (labels != -1)
+        id_features = features[idx_id]  # [M, D]
+        id_labels = labels[idx_id]
+        proto_targets = norm_proto[id_labels.long()]  # [M, D]
+        loss_pe = (1 - F.cosine_similarity(id_features, proto_targets)).mean()
+    else:
+        loss_pe = torch.tensor(0.0, device=device)
+
+    # OE Push Loss (OH)
+    with torch.no_grad():
+        norm_proto = F.normalize(prototypes, dim=1)
+
+    idx_oe = (labels == -1)
+    if idx_oe.any():
+        features_oe = features[idx_oe]  # [K, D]
+        sim_oe = torch.matmul(F.normalize(features_oe, dim=1), norm_proto.T)  # [K, C]
+        max_sim = sim_oe.max(dim=1)[0]
+        loss_oh = F.relu(max_sim - margin).mean()
+    else:
+        loss_oh = torch.tensor(0.0, device=device)
+
+    loss_total = supcon_loss + lambda_pe * loss_pe + lambda_oh * loss_oh
+    return loss_total, {
+        'supcon': supcon_loss.item(),
+        'tightness': loss_pe.item(),
+        'push_oe': loss_oh.item()
+    }

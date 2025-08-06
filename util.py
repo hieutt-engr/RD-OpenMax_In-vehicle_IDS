@@ -5,12 +5,15 @@ import random
 import json
 import pickle
 import codecs
+import torch.nn as nn
 import torch
 import datetime
 import numpy as np
 import pandas as pd
-
+import torch.nn.functional as F
 import torch.optim as optim
+
+from sklearn.cluster import KMeans
 
 class TwoCropTransform:
     """Create two crops of the same image"""
@@ -21,6 +24,32 @@ class TwoCropTransform:
     def __call__(self, x):
         return [self.transform(x), self.transform(x)]
 
+class SelectiveNormalize:
+    def __init__(self, mean, std, apply_channels):
+        self.mean = mean
+        self.std = std
+        self.apply_channels = apply_channels
+
+    def __call__(self, tensor):
+        for c in self.apply_channels:
+            tensor[c] = (tensor[c] - self.mean[c]) / self.std[c]
+        return tensor
+
+
+class SelectiveTransform:
+    def __init__(self, transform_fn, apply_channels):
+        self.transform_fn = transform_fn
+        self.apply_channels = apply_channels
+
+    def __call__(self, x):
+        out = []
+        for i in range(x.shape[0]):
+            ch = x[i:i+1]  # shape (1, H, W)
+            if i in self.apply_channels:
+                ch = self.transform_fn(ch)
+            out.append(ch)
+        return torch.cat(out, dim=0)
+
 class AddGaussianNoise(object):
     def __init__(self, mean=0.0, std=0.1):
         self.mean = mean
@@ -29,6 +58,32 @@ class AddGaussianNoise(object):
     def __call__(self, tensor):
         noise = torch.randn(tensor.size()) * self.std + self.mean
         return tensor + noise
+    
+
+class RandomPatchShuffle(nn.Module):
+    def __init__(self, num_patches=4):
+        super().__init__()
+        self.num_patches = num_patches
+
+    def forward(self, x):
+        C, H, W = x.shape
+        ph, pw = H // self.num_patches, W // self.num_patches
+
+        patches = []
+        for i in range(self.num_patches):
+            for j in range(self.num_patches):
+                patch = x[:, i*ph:(i+1)*ph, j*pw:(j+1)*pw]
+                patches.append(patch)
+
+        random.shuffle(patches)
+
+        out = torch.zeros_like(x)
+        idx = 0
+        for i in range(self.num_patches):
+            for j in range(self.num_patches):
+                out[:, i*ph:(i+1)*ph, j*pw:(j+1)*pw] = patches[idx]
+                idx += 1
+        return out
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -47,6 +102,119 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+# prototype_tracker.py
+
+# Hoạt động tương đối tốt 
+# class PrototypeTracker:
+#     def __init__(self, num_classes, feat_dim, device, momentum=0.9):
+#         """
+#         EMA prototype tracker.
+
+#         Args:
+#             num_classes (int): số class Known
+#             feat_dim (int): feature dim từ encoder
+#             device (torch.device): GPU/CPU
+#             momentum (float): beta cho EMA (default = 0.9)
+#         """
+#         self.num_classes = num_classes
+#         self.feat_dim = feat_dim
+#         self.device = device
+#         self.momentum = momentum
+
+#         # Init prototypes to zero
+#         self.prototypes = torch.zeros(num_classes, feat_dim, device=device)
+#         self.initialized = torch.zeros(num_classes, dtype=torch.bool, device=device)
+
+#     @torch.no_grad()
+#     def update(self, features, labels):
+#         """
+#         Update EMA prototype from batch features and labels.
+
+#         Args:
+#             features (Tensor): [B, D]
+#             labels (Tensor): [B]
+#         """
+#         features = F.normalize(features, dim=1)
+
+#         for class_id in labels.unique():
+#             mask = (labels == class_id)
+#             if mask.sum() == 0:
+#                 continue
+
+#             f_mean = features[mask].mean(dim=0)
+#             class_id = int(class_id)
+
+#             if not self.initialized[class_id]:
+#                 self.prototypes[class_id] = f_mean
+#                 self.initialized[class_id] = True
+#             else:
+#                 self.prototypes[class_id] = (
+#                     self.momentum * self.prototypes[class_id] +
+#                     (1 - self.momentum) * f_mean
+#                 )
+
+#     def get_prototypes(self):
+#         return F.normalize(self.prototypes, dim=1)
+
+
+class PrototypeTracker:
+    def __init__(self, num_classes, feat_dim, device, momentum=0.9):
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.device = device
+        self.momentum = momentum
+
+        self.prototypes = torch.zeros(num_classes, feat_dim, device=device)
+        self.initialized = torch.zeros(num_classes, dtype=torch.bool, device=device)
+
+        self.prev_prototypes = None  # dùng để tính shift
+        self.frozen = False          # cờ freeze
+        
+    @torch.no_grad()
+    def update(self, features, labels):
+        if self.frozen:
+            return
+
+        features = F.normalize(features, dim=1)
+
+        for class_id in labels.unique():
+            mask = (labels == class_id)
+            if mask.sum() == 0:
+                continue
+
+            f_mean = features[mask].mean(dim=0)
+            class_id = int(class_id)
+
+            if not self.initialized[class_id]:
+                self.prototypes[class_id] = f_mean
+                self.initialized[class_id] = True
+            else:
+                self.prototypes[class_id] = (
+                    self.momentum * self.prototypes[class_id] +
+                    (1 - self.momentum) * f_mean
+                )
+
+    def get_prototypes(self):
+        return F.normalize(self.prototypes, dim=1)
+
+    def freeze(self):
+        self.frozen = True
+
+    def is_frozen(self):
+        return self.frozen
+    def compute_shift(self):
+        """
+        Tính trung bình L2-distance giữa prototype hiện tại và trước đó.
+        """
+        if self.prev_prototypes is None:
+            self.prev_prototypes = self.prototypes.clone()
+            return float('inf')  # lần đầu luôn lớn
+
+        shift = torch.norm(self.prototypes - self.prev_prototypes, dim=1).mean().item()
+        self.prev_prototypes = self.prototypes.clone()
+        return shift
 
 
 def accuracy(output, target, topk=(1,)):
@@ -135,78 +303,21 @@ def get_universum_standard(images, labels, opt):
         universum[:, :, bbx1:bbx2, bby1:bby2] = images[:, :, bbx1:bbx2, bby1:bby2]
     return universum
 
-def get_universum(images, labels, opt):
-    """Calculating Mixup- or CutMix-induced universum from a batch of images
-    Args:
-        images: Tensor of input images (batch_size, C, H, W)
-        labels: Tensor of input labels (batch_size)
-        opt: Options containing settings like lambda and mixup type
-        all_labels: (Optional) List of all labels in the dataset (used for extended universum)
-        all_images: (Optional) List of all images in the dataset (used for extended universum)
-    Returns:
-        universum: Tensor of generated universum images
+def generate_oe_features(prototypes, noise_scale=0.3, num_samples=64):
     """
-    tmp = images.cpu()
-    label = labels.cpu()
-    bsz = tmp.shape[0]
-    bs = len(label)
+    Sinh OE feature bằng cách cộng nhiễu ngẫu nhiên vào prototype.
+    Không cần chạy qua encoder.
+    """
+    oe_feats = []
 
-    # Prepare class-based image lists
-    class_images = [[] for _ in range(max(label) + 1)]
-    for i in label.unique():
-        class_images[i] = np.where(label != i)[0]
+    proto_list = list(prototypes.values())
+    for _ in range(num_samples):
+        base_proto = proto_list[np.random.randint(len(proto_list))]
+        noise = torch.randn_like(base_proto) * noise_scale
+        sample = F.normalize(base_proto + noise, dim=0)
+        oe_feats.append(sample)
 
-    # Compute class counts and probabilities for balancing
-    class_counts = [len(class_images[c]) for c in range(len(class_images))]
-    epsilon = 1e-10
-    class_counts = np.array(class_counts, dtype=float)
-    weights = 1 / (class_counts + epsilon)  # Add epsilon to avoid division by zero
-
-    # Normalize weights to probabilities
-    if weights.sum() > 0:
-        probabilities = weights / weights.sum()
-    else:
-        probabilities = np.zeros_like(weights)
-    # Generate universum samples
-    units = []
-    for i in range(bsz):
-        current_label = labels[i % bs].item()
-
-        # Select other classes with available samples
-        other_classes = [c for c in range(len(class_images)) if c != current_label and len(class_images[c]) > 0]
-
-        if not other_classes:
-            fallback_classes = [c for c in range(len(class_images)) if len(class_images[c]) > 0]
-            if not fallback_classes:
-                units.append(tmp[random.choice(range(bsz))])  # Fallback to the current batch
-                continue
-            selected_class = random.choice(fallback_classes)
-        else:
-            selected_class = random.choices(other_classes, weights=[probabilities[c] for c in other_classes])[0]
-
-        # Select a random sample from the selected class
-        selected_index = random.choice(class_images[selected_class])
-        units.append(tmp[selected_index])
-
-    universum = torch.stack(units, dim=0).to(opt.device)
-
-    # Mixup or CutMix
-    lamda = opt.lamda
-    if not hasattr(opt, 'mix') or opt.mix == 'mixup':
-        # Using Mixup
-        universum = lamda * universum + (1 - lamda) * images
-    elif opt.mix == 'cutmix':
-        # Using CutMix
-        lam = 0
-        while lam < 0.45 or lam > 0.55:
-            bbx1, bby1, bbx2, bby2 = rand_bbox(images.size(), lamda)
-            lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (images.size()[-1] * images.size()[-2]))
-        universum[:, :, bbx1:bbx2, bby1:bby2] = images[:, :, bbx1:bbx2, bby1:bby2]
-    else:
-        print("Warning: No valid mixup method specified. Returning original universum.")
-
-    return universum
-
+    return torch.stack(oe_feats)  # [B, D]
 
 
 def set_optimizer(opt, model):
@@ -217,7 +328,18 @@ def set_optimizer(opt, model):
     return optimizer
 
 
-def save_model(model, optimizer, opt, epoch, save_file):
+# def save_model(model, optimizer, opt, epoch, save_file):
+#     print('==> Saving...')
+#     state = {
+#         'opt': opt,
+#         'model': model.state_dict(),
+#         'optimizer': optimizer.state_dict(),
+#         'epoch': epoch
+#     }
+#     torch.save(state, save_file)
+#     del state
+
+def save_model(model, optimizer, opt, epoch, save_file, proto_tracker=None):
     print('==> Saving...')
     state = {
         'opt': opt,
@@ -225,6 +347,16 @@ def save_model(model, optimizer, opt, epoch, save_file):
         'optimizer': optimizer.state_dict(),
         'epoch': epoch
     }
+
+    if proto_tracker is not None:
+        state['proto_tracker'] = {
+            'prototypes': proto_tracker.prototypes.detach().cpu(),
+            'initialized': proto_tracker.initialized.detach().cpu(),
+            'momentum': proto_tracker.momentum,
+            'frozen': proto_tracker.frozen,
+            'prev_prototypes': proto_tracker.prev_prototypes.detach().cpu() if proto_tracker.prev_prototypes is not None else None
+        }
+
     torch.save(state, save_file)
     del state
 
@@ -390,7 +522,6 @@ def add_actual_attack_col(df, intervals, aid, payload, attack_name):
     return df
 
 
-
 def compute_class_means(model, train_loader, device):
     model.eval()
     features_list, labels_list = [], []
@@ -411,3 +542,29 @@ def compute_class_means(model, train_loader, device):
         class_mean = feats[idx].mean(dim=0)
         class_means.append(class_mean)
     return torch.stack(class_means, dim=0)  # [num_classes, D]
+
+
+def get_next_oe_batch(oe_iter, oe_loader, device):
+    """
+    Trả về một batch OE sample và gán label = -1 (unknown).
+
+    Args:
+        oe_iter: iterator hiện tại của OE loader
+        oe_loader: dataloader của OE
+        device: thiết bị CUDA/CPU
+
+    Returns:
+        x_oe: tensor features [B, C, H, W]
+        y_oe: tensor labels = -1 [B]
+        oe_iter: iterator đã cập nhật
+    """
+    try:
+        x_oe, _ = next(oe_iter)
+    except StopIteration:
+        oe_iter = iter(oe_loader)
+        x_oe, _ = next(oe_iter)
+    
+    x_oe = x_oe.to(device)
+    y_oe = torch.full((x_oe.size(0),), -1, dtype=torch.long, device=device)
+
+    return x_oe, y_oe, oe_iter

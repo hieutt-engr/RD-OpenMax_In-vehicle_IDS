@@ -1,3 +1,4 @@
+from collections import Counter
 import pandas as pd
 # import vaex
 import numpy as np
@@ -10,8 +11,10 @@ import time
 import _warnings
 import tensorflow as tf
 from tqdm import tqdm
+from scipy.stats import entropy
 import argparse
 import os
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
 can_ml_attributes = ['timestamp', 'arbitration_id', 'data_field', 'attack']
 
@@ -65,33 +68,66 @@ def normalize_time_zscore(time_series):
     normalized = (time_series - mean_val) / std_val
     return normalized
 
-def serialize_example(x, y): 
-    """converts x, y to tf.train.Example and serialize"""
-    id_seq, data_seq, timestamp = x
-    id_seq = tf.train.Int64List(value = np.array(id_seq).flatten())
-    data_seq = tf.train.Int64List(value = np.array(data_seq).flatten())
-    timestamp = tf.train.FloatList(value = np.array(timestamp).flatten())
+# def serialize_example(x, y): 
+#     """converts x, y to tf.train.Example and serialize"""
+#     id_seq, data_seq, timestamp = x
+#     id_seq = tf.train.Int64List(value = np.array(id_seq).flatten())
+#     data_seq = tf.train.Int64List(value = np.array(data_seq).flatten())
+#     timestamp = tf.train.FloatList(value = np.array(timestamp).flatten())
 
-    label = tf.train.Int64List(value = np.array([y]))
+#     label = tf.train.Int64List(value = np.array([y]))
+
+#     features = tf.train.Features(
+#         feature = {
+#             "id_seq": tf.train.Feature(int64_list = id_seq),
+#             "data_seq": tf.train.Feature(int64_list = data_seq),
+#             "timestamp": tf.train.Feature(float_list = timestamp),
+#             "label" : tf.train.Feature(int64_list = label)
+#         }
+#     )
+#     example = tf.train.Example(features = features)
+#     return example.SerializeToString()
+
+def serialize_example(x, y): 
+    id_seq, data_seq, timestamp, delta_ts, id_freq = x
+    id_seq = tf.train.Int64List(value=np.array(id_seq).flatten())
+    data_seq = tf.train.Int64List(value=np.array(data_seq).flatten())
+    timestamp = tf.train.FloatList(value=np.array(timestamp).flatten())
+    delta_ts = tf.train.FloatList(value=np.array(delta_ts).flatten())
+    id_freq = tf.train.FloatList(value=np.array(id_freq).flatten())
+
+    label = tf.train.Int64List(value=np.array([y]))
 
     features = tf.train.Features(
-        feature = {
-            "id_seq": tf.train.Feature(int64_list = id_seq),
-            "data_seq": tf.train.Feature(int64_list = data_seq),
-            "timestamp": tf.train.Feature(float_list = timestamp),
-            "label" : tf.train.Feature(int64_list = label)
+        feature={
+            "id_seq": tf.train.Feature(int64_list=id_seq),
+            "data_seq": tf.train.Feature(int64_list=data_seq),
+            "timestamp": tf.train.Feature(float_list=timestamp),
+            "delta_ts": tf.train.Feature(float_list=delta_ts),
+            "id_freq": tf.train.Feature(float_list=id_freq),
+            "label": tf.train.Feature(int64_list=label)
         }
     )
-    example = tf.train.Example(features = features)
+    example = tf.train.Example(features=features)
     return example.SerializeToString()
+
+
+
+# def write_tfrecord(data, filename):
+#     tfrecord_writer = tf.io.TFRecordWriter(filename)
+#     for _, row in tqdm(data.iterrows()):
+#         X = (row['id_seq'], row['data_seq'], row['timestamp'])
+#         Y = row['label']
+#         tfrecord_writer.write(serialize_example(X, Y))
+#     tfrecord_writer.close() 
 
 def write_tfrecord(data, filename):
     tfrecord_writer = tf.io.TFRecordWriter(filename)
     for _, row in tqdm(data.iterrows()):
-        X = (row['id_seq'], row['data_seq'], row['timestamp'])
+        X = (row['id_seq'], row['data_seq'], row['timestamp'], row['delta_ts'], row['id_freq'])
         Y = row['label']
         tfrecord_writer.write(serialize_example(X, Y))
-    tfrecord_writer.close() 
+    tfrecord_writer.close()
 
 def split_data(file_name, attack_id, window_size, strided_size, target_size=64):
     if not os.path.exists(file_name):
@@ -122,11 +158,72 @@ def split_data(file_name, attack_id, window_size, strided_size, target_size=64):
     timestamp = as_strided(df.timestamp.values, window_shape=window_size)[::strided_size]
 
     label = as_strided(df.attack.values, window_shape=window_size)[::strided_size]
+    
+  # === Compute raw delta_ts ===
+    ts_windows = as_strided(df['timestamp'].values, window_shape=window_size)[::strided_size]
+
+    delta_ts_all = []
+    for ts in ts_windows:
+        delta = np.diff(ts, prepend=ts[0])  # [0.0, ts[1]-ts[0], ..., ts[n]-ts[n-1]]
+        delta_ts_all.append(delta)
+    delta_ts_all = np.array(delta_ts_all)  # shape: [N, window_size]
+
+    # === log1p + RobustScaler (reduce effect of large outliers) ===
+    log_delta = np.log1p(delta_ts_all)  # more stable for small values
+    scaler_dt = RobustScaler(quantile_range=(5.0, 95.0))
+    log_delta_scaled = scaler_dt.fit_transform(log_delta)  # shape: [N, window_size]
+
+    # === Clip for numerical stability ===
+    log_delta_scaled = np.clip(log_delta_scaled, -3.0, 3.0)
+
+    # === Rescale to [0, 1] for compatibility with Normalize(mean=0.5, std=0.5) ===
+    min_dt = log_delta_scaled.min()
+    max_dt = log_delta_scaled.max()
+    log_delta_scaled = (log_delta_scaled - min_dt) / (max_dt - min_dt + 1e-8)
+
+    # === Expand to [target_size x target_size] ===
+    delta_ts = np.array([
+        np.tile(row, (target_size, 1))
+        for row in log_delta_scaled
+    ])  # shape: [N, target_size, target_size]
+
+    # -----------------------------------------------------------------------------
+
+    # === Compute id_freq ===
+    canid_windows = as_strided(df['arbitration_id'].values, window_shape=window_size)[::strided_size]
+    id_freq_all = []
+
+    for window in canid_windows:
+        count_map = Counter(window)
+        freqs = [count_map[can_id] for can_id in window]
+        id_freq_all.append(freqs)
+
+    id_freq_all = np.array(id_freq_all)  # shape: [N, window_size]
+
+    # === Normalize with StandardScaler ===
+    scaler_idf = StandardScaler()
+    id_freq_scaled = scaler_idf.fit_transform(id_freq_all)
+
+    # === Clip for stability (optional but recommended) ===
+    id_freq_scaled = np.clip(id_freq_scaled, -3.0, 3.0)
+
+    # === Rescale to [0, 1] ===
+    min_idf = id_freq_scaled.min()
+    max_idf = id_freq_scaled.max()
+    id_freq_scaled = (id_freq_scaled - min_idf) / (max_idf - min_idf + 1e-8)
+
+    # === Expand to [target_size x target_size] ===
+    id_freq = np.array([
+        np.tile(row, (target_size, 1))
+        for row in id_freq_scaled
+    ])  # shape: [N, target_size, target_size]
 
     df = pd.DataFrame({
         'id_seq': pd.Series(canid.tolist()),
         'data_seq': pd.Series(data.tolist()),
         'timestamp': pd.Series(timestamp.tolist()),
+        'delta_ts': pd.Series(delta_ts.tolist()),
+        'id_freq': pd.Series(id_freq.tolist()),
         'label': pd.Series(label.tolist())
     }, index=range(len(canid)))
 
@@ -139,7 +236,9 @@ def split_data(file_name, attack_id, window_size, strided_size, target_size=64):
     df['id_seq'] = df['id_seq'].apply(lambda x: reshape_to_target_size([item for sublist in x for item in sublist], target_size))
     df['data_seq'] = df['data_seq'].apply(lambda x: reshape_to_target_size([item for sublist in x for item in sublist], target_size))
     df['timestamp'] = df['timestamp'].apply(lambda x: parse_and_stack_timestamps(x, target_size))
-    return df[['id_seq', 'data_seq', 'timestamp', 'label']].reset_index().drop(['index'], axis=1)
+
+    return df[['id_seq', 'data_seq', 'timestamp', 'delta_ts', 'id_freq', 'label']].reset_index().drop(['index'], axis=1)
+
 
 
 def main(indir, outdir, attacks, window_size, strided, target_size=64):
@@ -171,17 +270,18 @@ def main(indir, outdir, attacks, window_size, strided, target_size=64):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--indir', type=str, default="./data/set_04/train_01/merged_no_accessory")
-    parser.add_argument('--outdir', type=str, default="./data/set_04/train_01/preprocessed/20_percent/TFRecord")
+    # parser.add_argument('--indir', type=str, default="./data/set_04/train_01/merged_no_accessory")
+    parser.add_argument('--indir', type=str, default="./data/set_01/train_01/merged")
+    parser.add_argument('--outdir', type=str, default="./data/set_01/train_01/preprocessed/six_features/TFRecord")
     parser.add_argument('--window_size', type=int, default=64)
     parser.add_argument('--strided', type=int, default=32)
     args = parser.parse_args()
     
-    # attack_types = ["combined", "DoS", "fuzzing", "gear", "interval", "rpm", 
-    #             "speed", "standstill", "systematic"]
+    # attack_types = ["double", "fuzzing", "interval", "speed", "systematic", "triple"]
     # attack_types = ["interval", "rpm", "speed", "standstill", "systematic"]
-    # attack_types = ['dos', 'double', 'force-neutral', 'fuzzing', 'triple']
-    attack_types = ['triple']
+    attack_types = ['dos', 'double', 'force-neutral', 'fuzzing', 'triple']
+    # attack_types = ['dos', 'force-neutral', 'rpm', 'standstill']
+    # attack_types = ['triple']
     if args.strided is None:
         args.strided = args.window_size
         

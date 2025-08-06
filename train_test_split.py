@@ -16,13 +16,15 @@ class TFwriter:
         
     def serialize_example(self, x, y):
         """Converts x (which will now be 32x32x3), y to tf.train.Example and serializes"""
-        id_seq, data_seq, timestamp = x
+        id_seq, data_seq, timestamp, delta_ts, id_freq = x
 
         # Flatten the 32x32 matrices into a single array before saving, and ensure int64
         id_seq = tf.train.Int64List(value=np.array(id_seq).flatten().tolist())
         data_seq = tf.train.Int64List(value=np.array(data_seq).flatten().tolist())
         timestamp = tf.train.FloatList(value=np.array(timestamp).flatten().tolist())
-
+        delta_ts = tf.train.FloatList(value=np.array(delta_ts).flatten().tolist())
+        id_freq = tf.train.FloatList(value=np.array(id_freq).flatten().tolist())
+        
         label = tf.train.Int64List(value=[int(y)])
 
         features = tf.train.Features(
@@ -30,6 +32,8 @@ class TFwriter:
                 "id_seq": tf.train.Feature(int64_list=id_seq),
                 "data_seq": tf.train.Feature(int64_list=data_seq),
                 "timestamp": tf.train.Feature(float_list=timestamp),
+                "delta_ts": tf.train.Feature(float_list=delta_ts),
+                "id_freq": tf.train.Feature(float_list=id_freq),
                 "label": tf.train.Feature(int64_list=label)
             }
         )
@@ -49,6 +53,8 @@ def read_tfrecord(example, window_size):
         'id_seq': tf.io.FixedLenFeature([window_size, window_size], tf.int64),
         'data_seq': tf.io.FixedLenFeature([window_size, window_size], tf.int64),
         'timestamp': tf.io.FixedLenFeature([window_size, window_size], tf.float32),
+        'delta_ts': tf.io.FixedLenFeature([window_size * window_size], tf.float32),
+        'id_freq': tf.io.FixedLenFeature([window_size * window_size], tf.float32),
         'label': tf.io.FixedLenFeature([1], tf.int64)
     }
     parsed_example = tf.io.parse_single_example(example, feature_description)
@@ -57,15 +63,17 @@ def read_tfrecord(example, window_size):
     features = {
         'id_seq': parsed_example['id_seq'],
         'data_seq': parsed_example['data_seq'],
-        'timestamp': parsed_example['timestamp']
+        'timestamp': parsed_example['timestamp'],
+        'delta_ts': parsed_example['delta_ts'],
+        'id_freq': parsed_example['id_freq'],
     }
-    
+
     # Return the input features and the label
     return features, parsed_example['label']
 def write_tfrecord(dataset, tfwriter):
     for batch_data in iter(dataset):
         # Access the features from batch_data[0]
-        features = zip(batch_data[0]['id_seq'], batch_data[0]['data_seq'], batch_data[0]['timestamp'])
+        features = zip(batch_data[0]['id_seq'], batch_data[0]['data_seq'], batch_data[0]['timestamp'], batch_data[0]['delta_ts'], batch_data[0]['id_freq'])
         
         # Access the labels directly from batch_data[1]
         labels = batch_data[1]  # Assuming labels are directly available in batch_data[1]
